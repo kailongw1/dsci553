@@ -1,116 +1,75 @@
 from pyspark import SparkContext
-from itertools import combinations
-from collections import defaultdict
-import time
 import sys
+import time
+import random
+from itertools import combinations
 
-# Hash function for the PCY algorithm
-def hash_pair(pair):
-    return hash(pair) % num_buckets
+def generate_hash_functions(n_functions, n_rows):
+    primes = [100019, 100043, 100049, 100057]
+    hash_params = [(random.randint(1, 1000), random.randint(0, 1000), random.choice(primes)) for _ in range(n_functions)]
+    def hash_family(i):
+        a, b, p = hash_params[i]
+        return lambda x: (a * x + b) % p % n_rows
+    return [hash_family(i) for i in range(n_functions)]
 
-# Function for the PCY algorithm's local phase
-def pcy_local(iterator, threshold):
-    item_counts = defaultdict(int)
-    buckets = defaultdict(int)
-    
-    local_baskets = list(iterator)  # Materialize the iterator into a list to reuse it
-    # Generate all combinations up to the size of the largest basket
-    max_len = max(len(basket) for basket in local_baskets)
-    
-    # Count itemsets and use a hash table to count the pairs
-    for basket in local_baskets:
-        for size in range(1, max_len + 1):
-            for itemset in combinations(sorted(set(basket)), size):
-                item_counts[itemset] += 1
-                if size == 2:  # Only hash pairs for buckets
-                    buckets[hash_pair(itemset)] += 1
-    
-    # Identify frequent buckets and candidate itemsets
-    frequent_buckets = {bucket for bucket, count in buckets.items() if count >= threshold}
-    candidate_itemsets = {item for item, count in item_counts.items() if count >= threshold}
-    
-    # Return all candidate itemsets
-    return list(candidate_itemsets)
-
-
-# Function for the PCY algorithm's global phase
-def pcy_global(candidate_itemsets, baskets, threshold):
-    global_item_counts = defaultdict(int)
-    
-    # Count all candidate itemsets across all baskets
-    for basket in baskets:
-        for candidate in candidate_itemsets:
-            if set(candidate).issubset(basket):
-                global_item_counts[candidate] += 1
-    
-    # Filter out the itemsets that do not meet the global threshold
-    frequent_itemsets = [itemset for itemset, count in global_item_counts.items() if count >= threshold]
-    
-    return frequent_itemsets
-
-def main():
-    sc = SparkContext(appName="PCYSONAlgorithm")
-
-    # Define the number of buckets for hashing
-    global num_buckets
-    num_buckets = 1000  # Adjust based on your dataset
-
-    # Parse command line arguments
-    case_number = int(sys.argv[1])
-    support = int(sys.argv[2])
-    input_file_path = sys.argv[3]
-    output_file_path = sys.argv[4]
-
-    # Start timing the execution
-    start_time = time.time()
-
-    # Read the data
-    raw_data = sc.textFile(input_file_path)
-    header = raw_data.first()
-    data = raw_data.filter(lambda row: row != header)
-
-    
-    # Depending on the case, transform the data into baskets differently
-    if case_number == 1:
-        # Case 1: Baskets are users with their reviewed business IDs
-        baskets = data.map(lambda x: (x.split(',')[0], x.split(',')[1])) \
-                          .distinct() \
-                          .groupByKey() \
-                          .map(lambda x: list(x[1]))
-    elif case_number == 2:
-        # Case 2: Baskets are businesses with their reviewing user IDs
-        baskets = data.map(lambda x: (x.split(',')[1], x.split(',')[0])) \
-                          .distinct() \
-                          .groupByKey() \
-                          .map(lambda x: list(x[1]))
-
-    # Apply the PCY algorithm using the SON framework
-    # Stage 1: Local phase
-    local_threshold = support / baskets.getNumPartitions()
-    local_candidates = baskets.mapPartitions(lambda partition: pcy_local(partition, local_threshold)) \
-                       .flatMap(lambda x: x) \
-                       .distinct() \
-                       .collect()
-    
-    # Stage 2: Global phase
-    global_frequent_itemsets = pcy_global(local_candidates, baskets.collect(), support)
-
-    # Save the results to the output file
-    with open(output_file_path, 'w') as file_out:
-        file_out.write("Candidates:\n")
-        # Write the candidates from the local phase
-        for candidate in sorted(local_candidates):
-            file_out.write(str(candidate) + '\n')
-        file_out.write("\nFrequent Itemsets:\n")
-        # Write the frequent itemsets from the global phase
-        for itemset in sorted(global_frequent_itemsets):
-            file_out.write(str(itemset) + '\n')
-
-    # Print the execution time
-    duration = time.time() - start_time
-    print(f"Duration: {duration}")
-
-    sc.stop()
+def jaccard_similarity(set1, set2):
+    return len(set1.intersection(set2)) / len(set1.union(set2))
 
 if __name__ == "__main__":
-    main()
+    sc = SparkContext.getOrCreate()
+    sc.setLogLevel("ERROR")
+
+    start_time = time.time()
+
+    input_file, output_file = sys.argv[1], sys.argv[2]
+
+    # Load data and exclude header
+    raw_data = sc.textFile(input_file).filter(lambda x: "user_id" not in x).map(lambda x: x.split(','))
+    
+    # Create dictionaries mapping users and businesses to indices
+    user_ids = raw_data.map(lambda x: x[0]).distinct().collect()
+    business_ids = raw_data.map(lambda x: x[1]).distinct().collect()
+    
+    user_index = {user_id: idx for idx, user_id in enumerate(user_ids)}
+    business_index = {business_id: idx for idx, business_id in enumerate(business_ids)}
+
+    # Initialize the signature matrix
+    num_hash_functions = 50
+    signature_matrix = [[float('inf') for _ in business_ids] for _ in range(num_hash_functions)]
+    hash_funcs = generate_hash_functions(num_hash_functions, len(user_ids))
+
+    # Apply hash functions to each user for each business
+    for row in raw_data.collect():
+        user, business = row[0], row[1]
+        if user in user_index:  # Check if user exists in user_index to avoid KeyError
+            for i, hash_func in enumerate(hash_funcs):
+                user_idx = user_index[user]
+                business_idx = business_index[business]
+                signature_matrix[i][business_idx] = min(signature_matrix[i][business_idx], hash_func(user_idx))
+
+    # Find candidate pairs based on signature matrix bands
+    candidate_pairs = set()
+    for i in range(num_hash_functions):
+        band = sc.parallelize(signature_matrix[i]).zipWithIndex().groupBy(lambda x: x[0] // (num_hash_functions / 10)).filter(lambda x: len(x[1]) > 1)
+        for group in band.collect():
+            pairs = combinations([business_ids[idx] for _, idx in group[1]], 2)
+            for pair in pairs:
+                candidate_pairs.add(tuple(sorted(pair)))
+
+    # Compute Jaccard similarity for candidate pairs
+    business_user_map = raw_data.map(lambda x: (x[1], set([x[0]]))).reduceByKey(lambda x, y: x.union(y)).collectAsMap()
+    results = []
+    for b1, b2 in candidate_pairs:
+        users1, users2 = business_user_map[b1], business_user_map[b2]
+        sim = jaccard_similarity(users1, users2)
+        if sim >= 0.5:
+            results.append((b1, b2, sim))
+
+    # Write results to file
+    with open(output_file, 'w') as f:
+        f.write("business_id_1,business_id_2,similarity\n")
+        for b1, b2, sim in sorted(results):
+            f.write(f"{b1},{b2},{sim}\n")
+
+    print(f"Execution time: {time.time() - start_time}")
+
